@@ -24,8 +24,7 @@ my $dummy = Dummy->new();
 
 can_ok $dummy, "foo";
 ok !defined $dummy->foo(), "foo works";
-ok exists $dummy->{foo}, "{foo} exists";
-ok !defined $dummy->{foo}, "{foo} defined";
+ok !exists $dummy->{foo}, "{foo} not exists";
 
 is $dummy->foo(42), 42, "foo sets integer";
 is $dummy->{foo}, 42, "{foo} matches integer";

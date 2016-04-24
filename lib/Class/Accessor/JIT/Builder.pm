@@ -6,6 +6,7 @@ use GCCJIT ":all";
 use GCCJIT::Context;
 use Ouroboros ":all";
 use Ouroboros::Spec;
+use Hash::Util qw/hash_value/;
 use Config;
 
 use constant {
@@ -19,6 +20,7 @@ my %TYPEMAP = (
     "SV" => GCC_JIT_TYPE_VOID,
     "AV" => GCC_JIT_TYPE_VOID,
     "HV" => GCC_JIT_TYPE_VOID,
+    "HE" => GCC_JIT_TYPE_VOID,
     "CV" => GCC_JIT_TYPE_VOID,
     "int" => GCC_JIT_TYPE_INT,
     "char" => GCC_JIT_TYPE_CHAR,
@@ -33,8 +35,8 @@ my %TYPEMAP = (
 );
 
 my %FN_SIGS = (
-    hv_fetch => [ "SV**", "PTHX", "HV*", "const char*", "STRLEN", "I32" ],
-    hv_store => [ "SV**", "PTHX", "HV*", "const char*", "STRLEN", "SV*", "U32" ],
+    hv_fetch_ent => [ "HE*", "PTHX", "HV*", "SV*", "I32", "U32" ],
+    hv_store_ent => [ "HE*", "PTHX", "HV*", "SV*", "SV*", "U32" ],
     newSVsv => [ "SV*", "PTHX", "SV*" ],
     newAV => [ "AV*", "PTHX" ],
     newRV_noinc => [ "SV*", "PTHX", "SV*" ],
@@ -45,10 +47,11 @@ my %FN_SIGS = (
 );
 
 sub new {
-    my ($class) = @_;
+    my ($class, @names) = @_;
 
     return bless {
         ctx => GCCJIT::Context->acquire(),
+        names => \@names,
     }, $class;
 }
 
@@ -248,24 +251,24 @@ sub check_for_arg {
 }
 
 sub build_getter {
-    my ($self, $block, $key, $len) = @_;
+    my ($self, $block, $name, $hash) = @_;
 
-    my $svpp = $self->call("hv_fetch", $self->athx, $self->{locals}{self}, $key, $len, $self->one("I32"));
-    my $comp = $self->comp(GCC_JIT_COMPARISON_EQ, $svpp, $self->null("SV**"));
+    my $he = $self->call("hv_fetch_ent", $self->athx, $self->{locals}{self}, $name, $self->zero("I32"), $hash);
+    my $comp = $self->comp(GCC_JIT_COMPARISON_EQ, $he, $self->null("HE*"));
 
     my ($null, $okay) = $self->cond($block, $comp);
 
     $self->return($null);
-    $self->return($okay, $svpp->dereference(undef));
+    $self->return($okay, $self->call("ouroboros_he_val", $self->athx, $he));
 }
 
 sub build_store {
-    my ($self, $value, $key, $len) = @_;
+    my ($self, $value, $name, $hash) = @_;
 
     my $block = $self->{func}->new_block("store");
 
     $block->add_eval(undef,
-        $self->call("hv_store", $self->athx, $self->{locals}{self}, $key, $len, $value, $self->zero("U32")));
+        $self->call("hv_store_ent", $self->athx, $self->{locals}{self}, $name, $value, $hash));
 
     return $block;
 }
@@ -310,10 +313,10 @@ sub build_setter_many {
 }
 
 sub build_setter {
-    my ($self, $block, $key, $len) = @_;
+    my ($self, $block, $name, $hash) = @_;
 
     my $val = $self->{func}->new_local(undef, $self->type("SV*"), "val");
-    my $set = $self->build_store($val, $key, $len);
+    my $set = $self->build_store($val, $name, $hash);
 
     my $two = $self->{ctx}->new_rvalue_from_int($self->type("int"), 2);
     my $comp = $self->comp(GCC_JIT_COMPARISON_EQ, $self->{values}{items}, $two);
@@ -326,29 +329,34 @@ sub build_setter {
     $self->return($set, $val);
 }
 
-my @results;
+my @keepalive;
 sub install {
     my ($self) = @_;
     my $result = $self->{ctx}->compile();
     my $code = $result->get_code(SYMBOL_NAME) or die "compilation failed";
-    push @results, $result;
+    push @keepalive, $result;
     return DynaLoader::dl_install_xsub("Class::Accessor::JIT::xs_accessor", $code);
 }
 
 sub build {
     my ($self, $field_name) = @_;
 
+    push @keepalive, \$field_name;
+
     $self->{ctx}->set_int_option(GCC_JIT_INT_OPTION_OPTIMIZATION_LEVEL, 3);
+    #$self->{ctx}->set_bool_option(GCC_JIT_BOOL_OPTION_DEBUGINFO, 1);
+    #$self->{ctx}->set_bool_option(GCC_JIT_BOOL_OPTION_KEEP_INTERMEDIATES, 1);
 
     my $init = $self->init_function();
+
     my $body = $self->check_for_obj($init);
     my ($get, $set) = $self->check_for_arg($body);
 
-    my $key = $self->{ctx}->new_string_literal($field_name);
-    my $len = $self->{ctx}->new_rvalue_from_int($self->type("STRLEN"), length $field_name);
+    my $name = $self->{ctx}->new_rvalue_from_ptr($self->type("SV*"), int \$field_name);
+    my $hash = $self->{ctx}->new_rvalue_from_int($self->type("U32"), hash_value($field_name));
 
-    $self->build_getter($get, $key, $len);
-    $self->build_setter($set, $key, $len);
+    $self->build_getter($get, $name, $hash);
+    $self->build_setter($set, $name, $hash);
 
     return $self->install();
 }
